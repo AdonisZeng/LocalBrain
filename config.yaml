@@ -1,0 +1,130 @@
+app:
+  data_dir: ./data
+  environment: development
+  name: LocalBrain
+  version: 1.0.0
+  watch_directory: ./data/documents
+backup:
+  destinations:
+  - path: ./backups
+    type: local
+  enabled: false
+  retention_days: 30
+  schedule: 0 2 * * *
+cache:
+  enabled: true
+  max_size_mb: 512
+  ttl_seconds: 3600
+  type: memory
+import_export:
+  export_formats:
+  - obsidian
+  - json
+  - markdown
+  import:
+    support_logseq: true
+    support_notion: true
+    support_obsidian: true
+  obsidian:
+    enabled: true
+    frontmatter_format: yaml
+    include_metadata: true
+    link_format: wikilink
+logging:
+  file_path: ./logs/localbrain.log
+  format: json
+  level: INFO
+  output:
+  - console
+  rotation:
+    backup_count: 5
+    max_bytes: 10485760
+models:
+  document_processing:
+    chunk_overlap: 50
+    chunk_size: 500
+    splitting_strategies:
+      code:
+        chunk_overlap: 100
+        chunk_size: 1000
+        language: auto
+        strategy: ast_aware
+      markdown:
+        chunk_overlap: 50
+        chunk_size: 500
+        strategy: markdown_header
+        strip_headers: false
+      pdf:
+        chunk_overlap: 100
+        chunk_size: 800
+        respect_page_boundaries: true
+        strategy: semantic
+      txt:
+        chunk_overlap: 50
+        chunk_size: 500
+        strategy: recursive
+    supported_formats:
+    - md
+    - txt
+    - pdf
+  embedding:
+    provider: lmstudio
+    providers:
+      huggingface:
+        device: cpu
+        dimension: 384
+        model_name: sentence-transformers/all-MiniLM-L6-v2
+      lmstudio:
+        base_url: http://localhost:1234/v1
+        dimension: 1024
+        model_name: text-embedding-bge-m3
+  evaluation:
+    enabled: false
+    ragas:
+      metrics:
+      - faithfulness
+      - answer_relevance
+      - context_precision
+      - context_recall
+      sample_size: 100
+    relevance_threshold: 0.3
+  hybrid_search:
+    reranking:
+      enabled: false
+      model: cross-encoder/ms-marco-MiniLM-L-6-v2
+      top_n: 10
+    rrf_k: 60
+    weights:
+      keyword: 0.5
+      semantic: 0.5
+  keyword_search:
+    provider: bm25
+  llm:
+    provider: lmstudio
+    providers:
+      lmstudio:
+        api_key: ''
+        base_url: http://localhost:1234/v1
+        model_name: qwen3.5-4b
+  vectorstore:
+    compression:
+      enabled: true
+      maxContextChars: 4000
+      threshold: 0.5
+    parent_document:
+      childChunkSize: 400
+      enabled: true
+      parentChunkSize: 2000
+    persist_directory: ./data/chroma_db
+    provider: chroma
+run_mode:
+  allow_remote: false
+  allowed_ips: []
+  mode: local
+security:
+  api_key_header: X-API-Key
+  auth_enabled: false
+  rate_limit:
+    enabled: true
+    lan_requests_per_minute: 120
+    requests_per_minute: 60
