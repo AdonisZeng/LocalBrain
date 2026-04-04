@@ -2,7 +2,7 @@ app:
   data_dir: ./data
   environment: development
   name: LocalBrain
-  version: 1.0.0
+  version: 0.1.0
   watch_directory: ./data/documents
 backup:
   destinations:
