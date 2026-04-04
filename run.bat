@@ -3,4 +3,4 @@ title LocalBrain
 
 cd /d "%~dp0"
 
-D:\Software\uv\envs\trae_cn\Scripts\python.exe launcher.py
+"%~dp0.venv\Scripts\python.exe" launcher.py

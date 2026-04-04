@@ -181,11 +181,14 @@ class VectorStore:
                     all_ids.extend(ids)
                 
                 if self.parent_document_enabled and hasattr(self, 'parent_vectorstore'):
-                    parent_docs = self.parent_text_splitter.split_documents(batch)
-                    for parent_doc in parent_docs:
-                        parent_doc.metadata["doc_id"] = batch[0].metadata.get("doc_id")
-                        parent_doc.metadata["title"] = batch[0].metadata.get("title")
-                    self.parent_vectorstore.add_documents(parent_docs)
+                    # 为每个文档单独处理 parent chunks，避免 doc_id 混淆
+                    for doc in batch:
+                        doc_chunks = [doc]
+                        parent_docs = self.parent_text_splitter.split_documents(doc_chunks)
+                        for parent_doc in parent_docs:
+                            parent_doc.metadata["doc_id"] = doc.metadata.get("doc_id")
+                            parent_doc.metadata["title"] = doc.metadata.get("title")
+                        self.parent_vectorstore.add_documents(parent_docs)
                 
                 batch_elapsed = time.time() - batch_start
                 total_elapsed = time.time() - start_time
@@ -269,8 +272,8 @@ class VectorStore:
                 return docs
         except Exception as e:
             elapsed = time.time() - start_time
-            logger.error(f"Similarity search failed: {e}")
-            return []
+            logger.error(f"Similarity search failed: {e}", exc_info=True)
+            raise
 
     def similarity_search_with_score(
         self,
@@ -285,47 +288,72 @@ class VectorStore:
         logger.debug(f"Starting similarity search with score: query_size={query_size}, k={k}")
 
         try:
-            docs = self.similarity_search(
-                query=query,
-                k=k,
-                filter=filter,
-                use_parent_document=use_parent_document,
-                use_compression=False,
-            )
-            
-            results = [(doc, 1.0 - (i * 0.1)) for i, doc in enumerate(docs)]
-            
-            if use_compression and self.compression_enabled and self.compression_threshold > 0:
+            # 获取基础搜索结果（带真实分数）
+            if use_parent_document and self.parent_document_enabled and hasattr(self, 'parent_vectorstore'):
+                child_docs = self.vectorstore.similarity_search(
+                    query=query,
+                    k=k,
+                    filter=filter,
+                )
+                if not child_docs:
+                    return []
+
+                parent_ids = set()
+                parent_doc_ids = []
+                for doc in child_docs:
+                    doc_id = doc.metadata.get("doc_id")
+                    if doc_id and doc_id not in parent_ids:
+                        parent_ids.add(doc_id)
+                        parent_doc_ids.append(doc_id)
+
+                if parent_doc_ids:
+                    # 使用 Chroma 的真实相似度分数
+                    results = self.parent_vectorstore.similarity_search_with_score(
+                        query=query,
+                        k=len(parent_doc_ids),
+                        filter={"doc_id": {"$in": parent_doc_ids}},
+                    )
+                else:
+                    results = [(doc, 0.0) for doc in child_docs]
+            else:
+                results = self.vectorstore.similarity_search_with_score(
+                    query=query,
+                    k=k,
+                    filter=filter,
+                )
+
+            # 应用压缩过滤
+            if use_compression and self.compression_enabled and self.compression_threshold > 0 and results:
                 max_score = results[0][1] if results else 1.0
                 min_score = results[-1][1] if results else 0.0
                 score_range = max_score - min_score if max_score != min_score else 1.0
-                
+
                 filtered_results = []
                 total_chars = 0
-                
+
                 for doc, score in results:
                     normalized_score = (max_score - score) / score_range if score_range > 0 else 0
-                    
+
                     if normalized_score >= self.compression_threshold:
                         continue
-                    
+
                     doc_chars = len(doc.page_content)
                     if total_chars + doc_chars > self.max_context_chars:
                         continue
-                    
+
                     filtered_results.append((doc, score))
                     total_chars += doc_chars
-                
+
                 logger.info(f"Compression: filtered from {len(results)} to {len(filtered_results)} docs, chars: {total_chars}")
                 results = filtered_results
-            
+
             elapsed = time.time() - start_time
             logger.info(f"Similarity search with score complete: found {len(results)} results in {elapsed * 1000:.2f}ms")
             return results
         except Exception as e:
             elapsed = time.time() - start_time
-            logger.error(f"Similarity search with score failed: {e}")
-            return []
+            logger.error(f"Similarity search with score failed: {e}", exc_info=True)
+            raise
 
     def delete(self, ids: Optional[List[str]] = None, filter: Optional[Dict[str, Any]] = None):
         start_time = time.time()

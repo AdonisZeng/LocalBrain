@@ -148,16 +148,17 @@ class DocumentLoader:
         使用 PyMuPDF 快速提取 PDF 文本（并行处理）
         """
         docs = []
-        
+        fitz_doc = None
+
         try:
             import fitz
-            doc = fitz.open(file_path)
-            total_pages = len(doc)
+            fitz_doc = fitz.open(file_path)
+            total_pages = len(fitz_doc)
             logger.info(f"Loading PDF with PyMuPDF (fast mode): {file_path}, total_pages: {total_pages}")
-            
+
             def extract_page(page_num: int) -> Optional[Document]:
                 try:
-                    page = doc[page_num]
+                    page = fitz_doc[page_num]
                     text = page.get_text()
                     if text and is_valid_text(text):
                         return Document(
@@ -170,17 +171,31 @@ class DocumentLoader:
                 except Exception as e:
                     logger.debug(f"Failed to extract page {page_num}: {e}")
                 return None
-            
+
             num_workers = min(multiprocessing.cpu_count(), 8)
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 futures = {executor.submit(extract_page, i): i for i in range(total_pages)}
-                
+
                 for future in as_completed(futures):
                     result = future.result()
                     if result:
                         docs.append(result)
-            
-            doc.close()
+
+            if docs:
+                docs.sort(key=lambda x: x.metadata.get("page", 0))
+                path = Path(file_path)
+                for d in docs:
+                    d.metadata["file_path"] = str(file_path)
+                    d.metadata["file_name"] = path.name
+                    d.metadata["file_type"] = "pdf"
+                logger.info(f"Loaded PDF with PyMuPDF (fast): {file_path}, pages: {len(docs)}")
+                return docs
+
+        except Exception as e:
+            logger.debug(f"PyMuPDF fast mode failed: {e}")
+        finally:
+            if fitz_doc is not None:
+                fitz_doc.close()
             
             if docs:
                 docs.sort(key=lambda x: x.metadata.get("page", 0))

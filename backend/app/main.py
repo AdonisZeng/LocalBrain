@@ -1,11 +1,16 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pathlib import Path
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from app.api import documents, search, qa, categories, settings, models
 from app.services.database import db
 from app.models.database import Base
 from app.core.logging_config import setup_logging, get_logger
+from app.core.config import get_config
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
@@ -28,6 +33,16 @@ def create_app() -> FastAPI:
         description="本地知识库管理系统 API",
         version="1.0.0",
     )
+
+    # 读取限流配置
+    config = get_config()
+    rate_limit_config = config.security.rate_limit
+    requests_per_minute = rate_limit_config.get("requests_per_minute", 60)
+
+    # 创建限流器
+    limiter = Limiter(key_func=get_remote_address, default_limits=[f"{requests_per_minute}/minute"])
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     app.add_middleware(
         CORSMiddleware,

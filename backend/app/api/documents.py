@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 from typing import List, Optional
 from pathlib import Path
 import shutil
 import time
 import asyncio
+import re
 
 from app.models.schemas import (
     DocumentCreate, DocumentResponse, DocumentListResponse,
@@ -19,6 +20,20 @@ from app.core.logging_config import get_logger
 
 router = APIRouter()
 logger = get_logger("documents")
+
+# 文件上传安全配置
+MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
+ALLOWED_EXTENSIONS = {'.pdf', '.md', '.txt', '.markdown'}
+FILENAME_SANITIZE_PATTERN = re.compile(r'[^\w\s\-\.]+')
+
+
+def sanitize_filename(filename: str) -> str:
+    """清理文件名，防止路径遍历"""
+    safe_name = FILENAME_SANITIZE_PATTERN.sub('', filename)
+    safe_name = safe_name.replace('..', '').replace('/', '').replace('\\', '')
+    if not safe_name or safe_name.startswith('.'):
+        safe_name = f"document_{int(time.time())}"
+    return safe_name
 
 
 def get_or_create_default_category(db: Session) -> Category:
@@ -164,19 +179,39 @@ async def upload_document(
 ):
     start_time = time.time()
     logger.info(f"Uploading document: filename={file.filename}, category_id={category_id}")
-    
+
+    # 1. 路径遍历保护：清理文件名
+    safe_filename = sanitize_filename(file.filename)
+    original_ext = Path(file.filename).suffix.lower()
+    file_ext = Path(safe_filename).suffix.lower()
+
+    # 2. 文件类型验证
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件类型: {file_ext}。支持的类型: {', '.join(ALLOWED_EXTENSIONS)}"
+        )
+
     upload_dir = DATA_DIR / "documents"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    file_path = upload_dir / file.filename
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    file_size = file_path.stat().st_size
-    logger.info(f"File saved to disk: filename={file.filename}, file_size={file_size}")
+    file_path = upload_dir / safe_filename
 
-    file_type = Path(file.filename).suffix.lstrip(".")
+    # 3. 文件大小限制：先读取到内存再写入
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件大小超过限制 ({MAX_FILE_SIZE // (1024*1024)}MB)"
+        )
+
+    with open(file_path, "wb") as buffer:
+        buffer.write(content)
+
+    file_size = file_path.stat().st_size
+    logger.info(f"File saved to disk: filename={safe_filename}, file_size={file_size}")
+
+    file_type = file_ext.lstrip(".")
 
     if category_id:
         category = db.query(Category).filter(Category.id == category_id).first()
@@ -188,7 +223,7 @@ async def upload_document(
         category_id = default_cat.id
 
     db_document = Document(
-        title=Path(file.filename).stem,
+        title=Path(safe_filename).stem,
         file_path=str(file_path),
         file_type=file_type,
         content=None,
@@ -233,11 +268,25 @@ async def list_documents(
 async def list_documents_grouped(
     db: Session = Depends(get_db),
 ):
+    # 优化：使用单次查询获取所有文档，避免 N+1 查询
     categories = db.query(Category).all()
-    
+    all_docs = db.query(Document).all()
+
+    # 按 category_id 分组
+    docs_by_category = {}
+    for doc in all_docs:
+        cat_id = doc.category_id
+        if cat_id not in docs_by_category:
+            docs_by_category[cat_id] = []
+        docs_by_category[cat_id].append(doc)
+
+    # 计算每个 category 的文档数量
+    category_doc_counts = {cat_id: len(docs) for cat_id, docs in docs_by_category.items()}
+
     result = []
     for cat in categories:
-        docs = db.query(Document).filter(Document.category_id == cat.id).all()
+        docs = docs_by_category.get(cat.id, [])
+        doc_count = len(docs)
         doc_responses = []
         for doc in docs:
             doc_responses.append(DocumentResponse(
@@ -256,22 +305,22 @@ async def list_documents_grouped(
                     name=cat.name,
                     color=cat.color,
                     created_at=cat.created_at,
-                    document_count=len(docs),
+                    document_count=doc_count,
                 ) if cat else None,
             ))
-        
+
         result.append({
             "category": CategoryResponse(
                 id=cat.id,
                 name=cat.name,
                 color=cat.color,
                 created_at=cat.created_at,
-                document_count=len(docs),
+                document_count=doc_count,
             ),
             "documents": doc_responses,
         })
-    
-    uncategorized_docs = db.query(Document).filter(Document.category_id == None).all()
+
+    uncategorized_docs = docs_by_category.get(None, [])
     if uncategorized_docs:
         doc_responses = []
         for doc in uncategorized_docs:

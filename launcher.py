@@ -58,7 +58,7 @@ class LocalBrainLauncher:
         time.sleep(0.5)
         
         self.log("启动后端服务...")
-        venv_python = Path(r"D:\Software\uv\envs\trae_cn\Scripts\python.exe")
+        venv_python = Path(__file__).parent / ".venv" / "Scripts" / "python.exe"
         if not venv_python.exists():
             venv_python = Path(sys.executable)
         

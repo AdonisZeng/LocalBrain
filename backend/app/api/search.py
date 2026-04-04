@@ -6,6 +6,7 @@ from app.models.schemas import SearchResponse, SearchResult
 from app.models.database import Document
 from app.services.database import get_db
 from app.rag.vector_store import get_vector_store
+from app.core.config import get_config
 
 router = APIRouter()
 
@@ -98,19 +99,25 @@ async def hybrid_search(query: str, k: int = 4, db: Session = None) -> list[Sear
     semantic_results = await semantic_search(query, k=k * 2)
     keyword_results = await keyword_search(query, k=k * 2, db=db)
 
+    # 从配置读取混合搜索权重
+    config = get_config()
+    weights = config.hybrid_search.weights
+    semantic_weight = weights.semantic
+    keyword_weight = weights.keyword
+
     seen_ids = set()
     merged_results = []
 
     for result in semantic_results:
         if result.id not in seen_ids:
             seen_ids.add(result.id)
-            result.score = result.score * 0.6
+            result.score = result.score * semantic_weight
             merged_results.append(result)
 
     for result in keyword_results:
         if result.id not in seen_ids:
             seen_ids.add(result.id)
-            result.score = result.score * 0.4
+            result.score = result.score * keyword_weight
             merged_results.append(result)
 
     merged_results.sort(key=lambda x: x.score, reverse=True)

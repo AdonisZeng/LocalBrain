@@ -1,5 +1,6 @@
 from typing import Optional, List
 import time
+import asyncio
 from langchain_core.embeddings import Embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import OpenAIEmbeddings
@@ -158,7 +159,7 @@ class EmbeddingService:
         start_time = time.time()
         text_size = len(text) if text else 0
         logger.debug(f"Embedding query of size {text_size}")
-        
+
         embeddings = self.get_embeddings()
         try:
             result = embeddings.embed_query(text)
@@ -169,6 +170,16 @@ class EmbeddingService:
             elapsed = time.time() - start_time
             logger.error(f"Failed to embed query: {e}")
             raise
+
+    async def async_embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """异步封装，避免阻塞事件循环"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.embed_documents, texts)
+
+    async def async_embed_query(self, text: str) -> List[float]:
+        """异步封装，避免阻塞事件循环"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.embed_query, text)
 
 
 embedding_service: Optional[EmbeddingService] = None

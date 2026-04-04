@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from typing import Optional
 import time
 
@@ -69,8 +69,8 @@ async def ask_question(
             answer_size = len(answer) if answer else 0
             logger.info(f"LLM response received: size={answer_size} in {llm_elapsed * 1000:.2f}ms")
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            answer = f"生成回答时发生错误：{str(e)}。请检查 LLM 配置是否正确。 "
+            logger.error(f"LLM call failed: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"生成回答时发生错误：{str(e)}。请检查 LLM 配置是否正确。")
 
         total_elapsed = time.time() - start_time
         logger.info(f"Question processed successfully in {total_elapsed * 1000:.2f}ms")
@@ -82,9 +82,5 @@ async def ask_question(
         )
 
     except Exception as e:
-        logger.error(f"Error processing question: {e}")
-        return QAResult(
-            answer=f"处理问题时发生错误：{str(e)}",
-            sources=[],
-            question=question,
-        )
+        logger.error(f"Error processing question: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"处理问题时发生错误：{str(e)}")
