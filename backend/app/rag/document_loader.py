@@ -1,308 +1,91 @@
+"""
+Document loader and text splitter.
+
+Uses the DocumentLoaderRegistry for pluggable document format support.
+"""
+
 from typing import List, Optional
 from pathlib import Path
 from langchain_core.documents import Document
-from langchain_community.document_loaders import (
-    TextLoader,
-    PyPDFLoader,
-    DirectoryLoader,
-    UnstructuredMarkdownLoader,
-)
-from langchain_text_splitters import (
-    RecursiveCharacterTextSplitter,
-    MarkdownHeaderTextSplitter,
-    Language,
-)
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 
 from app.core.logging_config import get_logger
+from app.rag.loaders.registry import DocumentLoaderRegistry
+from app.rag.utils import is_valid_text, detect_encoding
 
 logger = get_logger("document_loader")
 
-_MARKDOWN_LOADER = None
-
-
-def _get_markdown_loader(encoding: str = "utf-8"):
-    global _MARKDOWN_LOADER
-    if _MARKDOWN_LOADER is None:
-        try:
-            _MARKDOWN_LOADER = UnstructuredMarkdownLoader
-        except NameError:
-            _MARKDOWN_LOADER = TextLoader
-    return _MARKDOWN_LOADER
-
-
-def detect_encoding(file_path: str) -> str:
-    try:
-        import chardet
-        with open(file_path, 'rb') as f:
-            raw_data = f.read(10000)
-            result = chardet.detect(raw_data)
-            encoding = result.get('encoding', 'utf-8')
-            confidence = result.get('confidence', 0)
-            logger.debug(f"Detected encoding: {encoding} (confidence: {confidence})")
-            return encoding if encoding else 'utf-8'
-    except ImportError:
-        logger.debug("chardet not installed, using utf-8")
-        return 'utf-8'
-    except Exception as e:
-        logger.warning(f"Failed to detect encoding: {e}, using utf-8")
-        return 'utf-8'
-
-
-def is_valid_text(text: str) -> bool:
-    if not text or not text.strip():
-        return False
-    
-    printable_chars = sum(1 for c in text if c.isprintable() or c in '\n\r\t')
-    total_chars = len(text)
-    
-    if total_chars == 0:
-        return False
-    
-    ratio = printable_chars / total_chars
-    return ratio > 0.8
-
 
 class DocumentLoader:
+    """
+    Document loader that delegates to registered loaders.
+
+    This class maintains backward compatibility and delegates
+    to the DocumentLoaderRegistry for actual loading.
+    """
+
     def __init__(self, encoding: str = "utf-8", fast_mode: bool = True):
         self.encoding = encoding
         self.fast_mode = fast_mode
 
     def load_file(self, file_path: str) -> List[Document]:
+        """
+        Load a document from file.
+
+        Delegates to the appropriate loader registered in DocumentLoaderRegistry.
+
+        Args:
+            file_path: Path to the file to load
+
+        Returns:
+            List of LangChain Document objects
+        """
         path = Path(file_path)
         suffix = path.suffix.lower()
 
+        # Check if we have a loader for this extension
         try:
-            if suffix == ".pdf":
-                return self._load_pdf(file_path)
-            elif suffix in [".md", ".markdown"]:
-                return self._load_markdown(file_path)
-            elif suffix == ".txt":
-                return self._load_text(file_path)
-            elif suffix in [".doc", ".docx"]:
-                return self._load_docx(file_path)
-            else:
-                logger.warning(f"Unsupported file type: {suffix}")
-                return []
+            loader = DocumentLoaderRegistry.get_loader(file_path)
+            docs = loader.load(file_path)
 
+            if docs:
+                return docs
+        except ValueError as e:
+            logger.warning(f"No loader for {suffix}: {e}")
         except Exception as e:
             logger.error(f"Error loading file {file_path}: {e}")
             return []
 
-    def _load_pdf(self, file_path: str) -> List[Document]:
-        """
-        加载 PDF 文件
-        fast_mode=True: 使用 PyMuPDF 直接提取文本（快速）
-        fast_mode=False: 使用 pymupdf4llm 转换为 Markdown（保留格式）
-        """
-        docs = []
-        
-        if self.fast_mode:
-            docs = self._load_pdf_fast(file_path)
-            if docs:
-                return docs
-        
-        try:
-            import pymupdf4llm
-            
-            page_chunks = pymupdf4llm.to_markdown(
-                file_path,
-                page_chunks=True,
-            )
-            
-            for chunk in page_chunks:
-                text = chunk.get('text', '')
-                if text and is_valid_text(text):
-                    metadata = chunk.get('metadata', {})
-                    docs.append(Document(
-                        page_content=text,
-                        metadata={
-                            "page": metadata.get('page', 0),
-                            "source": file_path,
-                        }
-                    ))
-            
-            if docs:
-                path = Path(file_path)
-                for doc in docs:
-                    doc.metadata["file_path"] = str(file_path)
-                    doc.metadata["file_name"] = path.name
-                    doc.metadata["file_type"] = "pdf"
-                logger.info(f"Loaded PDF with pymupdf4llm: {file_path}, pages: {len(docs)}")
-                return docs
-                
-        except Exception as e:
-            logger.debug(f"pymupdf4llm failed: {e}")
-        
-        if not docs:
-            docs = self._load_pdf_fast(file_path)
-        
-        if not docs:
-            logger.warning(f"Failed to extract valid text from PDF: {file_path}")
-        
-        return docs
+        # Fall back to built-in loaders for backward compatibility
+        if suffix == ".pdf":
+            return self._load_pdf_fallback(file_path)
+        elif suffix in [".md", ".markdown"]:
+            return self._load_markdown_fallback(file_path)
+        elif suffix == ".txt":
+            return self._load_text_fallback(file_path)
+        elif suffix in [".doc", ".docx"]:
+            return self._load_docx_fallback(file_path)
+        else:
+            logger.warning(f"Unsupported file type: {suffix}")
+            return []
 
-    def _load_pdf_fast(self, file_path: str) -> List[Document]:
-        """
-        使用 PyMuPDF 快速提取 PDF 文本（并行处理）
-        """
-        docs = []
-        fitz_doc = None
+    def _load_pdf_fallback(self, file_path: str) -> List[Document]:
+        """Fallback PDF loader using PyMuPDF."""
+        from app.rag.loaders.pdf_loader import PDFLoader
+        loader = PDFLoader()
+        return loader.load(file_path)
 
-        try:
-            import fitz
-            fitz_doc = fitz.open(file_path)
-            total_pages = len(fitz_doc)
-            logger.info(f"Loading PDF with PyMuPDF (fast mode): {file_path}, total_pages: {total_pages}")
+    def _load_markdown_fallback(self, file_path: str) -> List[Document]:
+        """Fallback markdown loader."""
+        from langchain_community.document_loaders import TextLoader
 
-            def extract_page(page_num: int) -> Optional[Document]:
-                try:
-                    page = fitz_doc[page_num]
-                    text = page.get_text()
-                    if text and is_valid_text(text):
-                        return Document(
-                            page_content=text,
-                            metadata={
-                                "page": page_num + 1,
-                                "source": file_path,
-                            }
-                        )
-                except Exception as e:
-                    logger.debug(f"Failed to extract page {page_num}: {e}")
-                return None
-
-            num_workers = min(multiprocessing.cpu_count(), 8)
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(extract_page, i): i for i in range(total_pages)}
-
-                for future in as_completed(futures):
-                    result = future.result()
-                    if result:
-                        docs.append(result)
-
-            if docs:
-                docs.sort(key=lambda x: x.metadata.get("page", 0))
-                path = Path(file_path)
-                for d in docs:
-                    d.metadata["file_path"] = str(file_path)
-                    d.metadata["file_name"] = path.name
-                    d.metadata["file_type"] = "pdf"
-                logger.info(f"Loaded PDF with PyMuPDF (fast): {file_path}, pages: {len(docs)}")
-                return docs
-
-        except Exception as e:
-            logger.debug(f"PyMuPDF fast mode failed: {e}")
-        finally:
-            if fitz_doc is not None:
-                fitz_doc.close()
-            
-            if docs:
-                docs.sort(key=lambda x: x.metadata.get("page", 0))
-                path = Path(file_path)
-                for d in docs:
-                    d.metadata["file_path"] = str(file_path)
-                    d.metadata["file_name"] = path.name
-                    d.metadata["file_type"] = "pdf"
-                logger.info(f"Loaded PDF with PyMuPDF (fast): {file_path}, pages: {len(docs)}")
-                return docs
-                
-        except Exception as e:
-            logger.debug(f"PyMuPDF fast mode failed: {e}")
-        
-        try:
-            import pdfplumber
-            with pdfplumber.open(file_path) as pdf:
-                for page_num, page in enumerate(pdf.pages):
-                    text = page.extract_text()
-                    if text and is_valid_text(text):
-                        docs.append(Document(
-                            page_content=text,
-                            metadata={
-                                "page": page_num + 1,
-                                "source": file_path,
-                            }
-                        ))
-            
-            if docs:
-                path = Path(file_path)
-                for d in docs:
-                    d.metadata["file_path"] = str(file_path)
-                    d.metadata["file_name"] = path.name
-                    d.metadata["file_type"] = "pdf"
-                logger.info(f"Loaded PDF with pdfplumber: {file_path}, pages: {len(docs)}")
-                return docs
-                
-        except Exception as e:
-            logger.debug(f"pdfplumber failed: {e}")
-        
-        try:
-            loader = PyPDFLoader(file_path)
-            raw_docs = loader.load()
-            
-            for d in raw_docs:
-                if is_valid_text(d.page_content):
-                    docs.append(d)
-            
-            if docs:
-                path = Path(file_path)
-                for d in docs:
-                    d.metadata["file_path"] = str(file_path)
-                    d.metadata["file_name"] = path.name
-                    d.metadata["file_type"] = "pdf"
-                logger.info(f"Loaded PDF with PyPDFLoader: {file_path}, pages: {len(docs)}")
-                return docs
-                
-        except Exception as e:
-            logger.debug(f"PyPDFLoader failed: {e}")
-        
-        return docs
-
-    def _load_text(self, file_path: str) -> List[Document]:
-        encodings_to_try = ['utf-8', 'gbk', 'gb2312', 'gb18030', 'big5', 'utf-16']
-        
-        detected_encoding = detect_encoding(file_path)
-        if detected_encoding and detected_encoding.lower() not in [e.lower() for e in encodings_to_try]:
-            encodings_to_try.insert(0, detected_encoding)
-        
-        for encoding in encodings_to_try:
-            try:
-                loader = TextLoader(file_path, encoding=encoding)
-                docs = loader.load()
-                
-                if docs and docs[0].page_content:
-                    content = docs[0].page_content
-                    if is_valid_text(content):
-                        path = Path(file_path)
-                        for doc in docs:
-                            doc.metadata["file_path"] = str(file_path)
-                            doc.metadata["file_name"] = path.name
-                            doc.metadata["file_type"] = "txt"
-                        
-                        logger.info(f"Loaded text file: {file_path}, encoding: {encoding}")
-                        return docs
-                    else:
-                        logger.debug(f"Content invalid with encoding {encoding}")
-                        continue
-                        
-            except UnicodeDecodeError:
-                logger.debug(f"Failed to decode with encoding {encoding}")
-                continue
-            except Exception as e:
-                logger.debug(f"Error with encoding {encoding}: {e}")
-                continue
-        
-        logger.error(f"Failed to load text file with any encoding: {file_path}")
-        return []
-
-    def _load_markdown(self, file_path: str) -> List[Document]:
         encodings_to_try = ['utf-8', 'gbk', 'gb2312', 'gb18030']
-        
+
         for encoding in encodings_to_try:
             try:
                 loader = TextLoader(file_path, encoding=encoding)
                 docs = loader.load()
-                
+
                 if docs and docs[0].page_content:
                     content = docs[0].page_content
                     if is_valid_text(content):
@@ -311,34 +94,59 @@ class DocumentLoader:
                             doc.metadata["file_path"] = str(file_path)
                             doc.metadata["file_name"] = path.name
                             doc.metadata["file_type"] = "md"
-                        
-                        logger.info(f"Loaded markdown file: {file_path}, encoding: {encoding}")
                         return docs
-                    else:
-                        continue
-                        
             except UnicodeDecodeError:
                 continue
             except Exception as e:
                 logger.debug(f"Error with encoding {encoding}: {e}")
                 continue
-        
-        logger.error(f"Failed to load markdown file: {file_path}")
+
         return []
 
-    def _load_docx(self, file_path: str) -> List[Document]:
+    def _load_text_fallback(self, file_path: str) -> List[Document]:
+        """Fallback text loader."""
+        from langchain_community.document_loaders import TextLoader
+
+        encodings = ['utf-8', 'gbk', 'gb2312', 'gb18030', 'big5', 'utf-16']
+        detected = detect_encoding(file_path)
+        if detected and detected.lower() not in [e.lower() for e in encodings]:
+            encodings.insert(0, detected)
+
+        for encoding in encodings:
+            try:
+                loader = TextLoader(file_path, encoding=encoding)
+                docs = loader.load()
+
+                if docs and docs[0].page_content:
+                    content = docs[0].page_content
+                    if is_valid_text(content):
+                        path = Path(file_path)
+                        for doc in docs:
+                            doc.metadata["file_path"] = str(file_path)
+                            doc.metadata["file_name"] = path.name
+                            doc.metadata["file_type"] = "txt"
+                        return docs
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                logger.debug(f"Error with encoding {encoding}: {e}")
+                continue
+
+        return []
+
+    def _load_docx_fallback(self, file_path: str) -> List[Document]:
+        """Fallback DOCX loader."""
         try:
             from docx import Document as DocxDocument
-            
+
             doc = DocxDocument(file_path)
             content = "\n".join([para.text for para in doc.paragraphs if para.text])
-            
+
             if not is_valid_text(content):
-                logger.warning(f"Invalid content in docx file: {file_path}")
                 return []
-            
+
             path = Path(file_path)
-            result = [Document(
+            return [Document(
                 page_content=content,
                 metadata={
                     "file_path": str(file_path),
@@ -346,28 +154,40 @@ class DocumentLoader:
                     "file_type": "docx",
                 }
             )]
-            
-            logger.info(f"Loaded docx file: {file_path}")
-            return result
-            
         except ImportError:
-            logger.warning("python-docx not installed, cannot load .docx files")
+            logger.warning("python-docx not installed")
             return []
         except Exception as e:
-            logger.error(f"Failed to load docx file {file_path}: {e}")
+            logger.error(f"Failed to load docx: {e}")
             return []
 
     def load_directory(self, directory: str, glob_pattern: str = "**/*") -> List[Document]:
+        """
+        Load all supported documents from a directory.
+
+        Args:
+            directory: Directory path
+            glob_pattern: Glob pattern for file matching
+
+        Returns:
+            List of all loaded documents
+        """
         path = Path(directory)
         if not path.exists() or not path.is_dir():
             logger.warning(f"Directory not found: {directory}")
             return []
 
         all_docs = []
-        supported_extensions = [".md", ".markdown", ".txt", ".pdf", ".docx"]
+        supported_extensions = DocumentLoaderRegistry.list_extensions()
 
         for ext in supported_extensions:
-            for file_path in path.glob(f"{glob_pattern}{ext}"):
+            # Remove the leading dot for glob pattern
+            if ext.startswith('.'):
+                ext_pattern = f"*{ext}"
+            else:
+                ext_pattern = f"*.{ext}"
+
+            for file_path in path.glob(f"{glob_pattern}{ext_pattern}"):
                 docs = self.load_file(str(file_path))
                 all_docs.extend(docs)
 
@@ -376,6 +196,12 @@ class DocumentLoader:
 
 
 class TextSplitter:
+    """
+    Text splitter for document chunking.
+
+    Supports different strategies based on file type.
+    """
+
     def __init__(
         self,
         chunk_size: int = 500,
@@ -387,6 +213,7 @@ class TextSplitter:
         self.strategies = splitting_strategies or {}
 
     def split_documents(self, documents: List[Document]) -> List[Document]:
+        """Split documents into chunks."""
         if not documents:
             return []
 
@@ -397,12 +224,11 @@ class TextSplitter:
             splits = self._split_by_type(doc, file_type)
             all_splits.extend(splits)
 
-        logger.info(
-            f"Split {len(documents)} documents into {len(all_splits)} chunks"
-        )
+        logger.info(f"Split {len(documents)} documents into {len(all_splits)} chunks")
         return all_splits
 
     def _split_by_type(self, doc: Document, file_type: str) -> List[Document]:
+        """Split document based on its type."""
         if file_type in ["md", "markdown"]:
             return self._split_markdown(doc)
         elif file_type == "pdf":
@@ -411,6 +237,7 @@ class TextSplitter:
             return self._split_text(doc)
 
     def _split_markdown(self, doc: Document) -> List[Document]:
+        """Split markdown document by headers."""
         headers_to_split_on = [
             ("#", "header1"),
             ("##", "header2"),
@@ -445,6 +272,7 @@ class TextSplitter:
         return final_splits
 
     def _split_pdf(self, doc: Document) -> List[Document]:
+        """Split PDF document."""
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size or 800,
             chunk_overlap=self.chunk_overlap or 100,
@@ -458,6 +286,7 @@ class TextSplitter:
         return splits
 
     def _split_text(self, doc: Document) -> List[Document]:
+        """Split plain text document."""
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,

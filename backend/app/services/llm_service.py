@@ -1,122 +1,70 @@
+"""
+LLM Service with pluggable provider support via registry.
+"""
+
 from typing import Optional, Generator
-import httpx
 import time
-from langchain_openai import ChatOpenAI
-from langchain_community.llms import Ollama
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.config_manager import load_config
 from app.core.logging_config import get_logger
+from app.core.events import ConfigEvent
+from app.services.base import BaseModelService
+
+# Import providers to trigger registration via decorators
+from app.providers.llm import LLMProviderRegistry
 
 logger = get_logger("llm_service")
 
 
-class LLMService:
-    def __init__(self):
-        self._llm: Optional[BaseChatModel] = None
-        self._config: Optional[dict] = None
-        self._load_config()
+class LLMService(BaseModelService):
+    """
+    LLM Service with pluggable provider support.
 
-    def _load_config(self):
+    Uses the LLMProviderRegistry for provider creation and
+    EventBus for hot-reload on configuration changes.
+    """
+
+    _subscribed_event_type = ConfigEvent.LLM_CONFIG_CHANGED
+    _default_provider = "openai"
+
+    def _load_config(self) -> None:
+        """Load LLM configuration from config file."""
         config = load_config()
         self._config = config.get("models", {}).get("llm", {})
-        provider = self._config.get("provider", "unknown")
+        self._provider = self._config.get("provider", self._default_provider)
         providers_config = self._config.get("providers", {})
-        provider_config = providers_config.get(provider, {})
-        base_url = provider_config.get("base_url", "")
-        model_name = provider_config.get("model_name", "")
-        logger.info(f"LLM config loaded: provider={provider}, base_url={base_url}, model={model_name}")
+        self._provider_config = providers_config.get(self._provider, {})
 
-    def _create_llm(self) -> BaseChatModel:
-        provider = self._config.get("provider", "openai")
-        providers_config = self._config.get("providers", {})
-        provider_config = providers_config.get(provider, {})
+        base_url = self._provider_config.get("base_url", "")
+        model_name = self._provider_config.get("model_name", "")
+        logger.info(f"LLM config loaded: provider={self._provider}, base_url={base_url}, model={model_name}")
 
-        base_url = provider_config.get("base_url", "")
-        model_name = provider_config.get("model_name", "gpt-3.5-turbo")
-        api_key = provider_config.get("api_key", "")
-        
-        logger.info(f"Creating LLM instance: provider={provider}, base_url={base_url}, model={model_name}")
+    def _create_instance(self) -> BaseChatModel:
+        """Create LLM instance using registry."""
+        logger.info(f"Creating LLM instance via registry: provider={self._provider}")
 
-        if provider == "lmstudio":
-            logger.debug("Creating LM Studio ChatOpenAI client")
-            http_client = httpx.Client(trust_env=False)
-            return ChatOpenAI(
-                base_url=base_url,
-                model=model_name,
-                api_key=api_key or "lm-studio",
-                temperature=0.7,
-                http_client=http_client,
-            )
-
-        elif provider == "ollama":
-            logger.debug("Creating Ollama ChatOpenAI client")
-            http_client = httpx.Client(trust_env=False)
-            return ChatOpenAI(
-                base_url=f"{base_url}/v1",
-                model=model_name,
-                api_key="ollama",
-                temperature=0.7,
-                http_client=http_client,
-            )
-
-        elif provider == "openai":
-            logger.debug("Creating OpenAI ChatOpenAI client")
-            return ChatOpenAI(
-                model=model_name,
-                api_key=api_key,
-                temperature=0.7,
-            )
-
-        elif provider == "anthropic":
-            from langchain_anthropic import ChatAnthropic
-            logger.debug("Creating Anthropic ChatAnthropic client")
-            return ChatAnthropic(
-                model=model_name,
-                api_key=api_key,
-                temperature=0.7,
-            )
-
-        elif provider == "custom":
-            logger.debug("Creating Custom ChatOpenAI client")
-            http_client = httpx.Client(trust_env=False)
-            return ChatOpenAI(
-                base_url=base_url,
-                model=model_name,
-                api_key=api_key or "custom",
-                temperature=0.7,
-                http_client=http_client,
-            )
-
-        else:
-            logger.warning(f"Unknown provider '{provider}', falling back to OpenAI")
-            return ChatOpenAI(
-                model="gpt-3.5-turbo",
-                api_key=api_key,
-                temperature=0.7,
-            )
+        try:
+            return LLMProviderRegistry.create_llm(self._provider, self._provider_config)
+        except ValueError as e:
+            logger.warning(f"Provider creation failed: {e}, falling back to OpenAI")
+            fallback_config = self._config.get("providers", {}).get("openai", {})
+            return LLMProviderRegistry.create_llm("openai", fallback_config)
 
     def get_llm(self) -> BaseChatModel:
-        if self._llm is None:
-            logger.debug("LLM instance not initialized, creating new instance")
-            self._llm = self._create_llm()
-        return self._llm
-
-    def reload_config(self):
-        logger.info("Reloading LLM config")
-        self._load_config()
-        self._llm = None
-        logger.info("LLM config reloaded, instance cleared")
+        """Get cached LLM instance, creating if necessary."""
+        return self.get_instance()
 
     def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Generate a response synchronously."""
         start_time = time.time()
         prompt_size = len(prompt) if prompt else 0
         logger.debug(f"Starting LLM generation: prompt_size={prompt_size}, has_system_prompt={bool(system_prompt)}")
-        
+
         llm = self.get_llm()
         messages = []
-        
+
         if system_prompt:
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=prompt))
@@ -133,13 +81,14 @@ class LLMService:
             raise
 
     def generate_stream(self, prompt: str, system_prompt: Optional[str] = None) -> Generator[str, None, None]:
+        """Generate a streaming response."""
         start_time = time.time()
         prompt_size = len(prompt) if prompt else 0
         logger.debug(f"Starting LLM streaming generation: prompt_size={prompt_size}")
-        
+
         llm = self.get_llm()
         messages = []
-        
+
         if system_prompt:
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=prompt))
@@ -162,6 +111,7 @@ llm_service: Optional[LLMService] = None
 
 
 def get_llm_service() -> LLMService:
+    """Get the global LLM service singleton."""
     global llm_service
     if llm_service is None:
         logger.debug("Creating new LLM service instance")

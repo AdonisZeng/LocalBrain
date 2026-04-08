@@ -1,149 +1,69 @@
-from typing import Optional, List
+"""
+Embedding Service with pluggable provider support via registry.
+"""
+
+from typing import List, Optional
 import time
 import asyncio
 from langchain_core.embeddings import Embeddings
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_openai import OpenAIEmbeddings
-import httpx
-from openai import OpenAI
 
 from app.core.config_manager import load_config
 from app.core.logging_config import get_logger
+from app.core.events import ConfigEvent
+from app.services.base import BaseModelService
+
+# Import providers to trigger registration via decorators
+from app.providers.embedding import EmbeddingProviderRegistry
 
 logger = get_logger("embedding_service")
 
 
-class LMStudioEmbeddings(Embeddings):
+class EmbeddingService(BaseModelService):
     """
-    自定义嵌入类，用于兼容 LM Studio 的嵌入 API。
-    LM Studio 只接受字符串格式的 input，不支持 token 数组。
+    Embedding Service with pluggable provider support.
+
+    Uses the EmbeddingProviderRegistry for provider creation and
+    EventBus for hot-reload on configuration changes.
     """
 
-    def __init__(self, base_url: str, model: str, api_key: str = "lm-studio"):
-        self._client = OpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            http_client=httpx.Client(trust_env=False),
-        )
-        self._model = model
+    _subscribed_event_type = ConfigEvent.EMBEDDING_CONFIG_CHANGED
+    _default_provider = "huggingface"
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """
-        对多个文档进行嵌入。
-        """
-        response = self._client.embeddings.create(
-            model=self._model,
-            input=texts,
-        )
-        return [item.embedding for item in response.data]
-
-    def embed_query(self, text: str) -> List[float]:
-        """
-        对单个查询进行嵌入。
-        """
-        response = self._client.embeddings.create(
-            model=self._model,
-            input=text,
-        )
-        return response.data[0].embedding
-
-
-class EmbeddingService:
-    def __init__(self):
-        self._embeddings: Optional[Embeddings] = None
-        self._config: Optional[dict] = None
-        self._load_config()
-
-    def _load_config(self):
+    def _load_config(self) -> None:
+        """Load embedding configuration from config file."""
         config = load_config()
         self._config = config.get("models", {}).get("embedding", {})
-        provider = self._config.get("provider", "huggingface")
+        self._provider = self._config.get("provider", self._default_provider)
         providers_config = self._config.get("providers", {})
-        provider_config = providers_config.get(provider, {})
-        base_url = provider_config.get("base_url", "")
-        model_name = provider_config.get("model_name", "")
-        logger.info(f"Embedding config loaded: provider={provider}, base_url={base_url}, model={model_name}")
+        self._provider_config = providers_config.get(self._provider, {})
 
-    def _create_embeddings(self) -> Embeddings:
-        provider = self._config.get("provider", "huggingface")
-        providers_config = self._config.get("providers", {})
-        provider_config = providers_config.get(provider, {})
+        base_url = self._provider_config.get("base_url", "")
+        model_name = self._provider_config.get("model_name", "")
+        dimension = self._provider_config.get("dimension", 0)
 
-        base_url = provider_config.get("base_url", "")
-        model_name = provider_config.get("model_name", "sentence-transformers/all-MiniLM-L6-v2")
-        
-        logger.info(f"Creating embedding instance: provider={provider}, base_url={base_url}, model={model_name}")
+        logger.info(f"Embedding config loaded: provider={self._provider}, base_url={base_url}, model={model_name}, dimension={dimension}")
 
-        if provider == "huggingface":
-            logger.debug("Creating HuggingFace embeddings client")
-            return HuggingFaceEmbeddings(
-                model_name=model_name,
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={"normalize_embeddings": True},
-            )
+    def _create_instance(self) -> Embeddings:
+        """Create embeddings instance using registry."""
+        logger.info(f"Creating embedding instance via registry: provider={self._provider}")
 
-        elif provider == "lmstudio":
-            logger.debug("Creating LM Studio embeddings client")
-            return LMStudioEmbeddings(
-                base_url=base_url,
-                model=model_name,
-                api_key="lm-studio",
-            )
-
-        elif provider == "ollama":
-            logger.debug("Creating Ollama OpenAIEmbeddings client")
-            http_client = httpx.Client(trust_env=False)
-            return OpenAIEmbeddings(
-                base_url=f"{base_url}/v1",
-                model=model_name,
-                api_key="ollama",
-                http_client=http_client,
-            )
-
-        elif provider == "openai":
-            api_key = provider_config.get("api_key", "")
-            logger.debug("Creating OpenAI embeddings client")
-            return OpenAIEmbeddings(
-                model=model_name,
-                api_key=api_key,
-            )
-
-        elif provider == "custom":
-            api_key = provider_config.get("api_key", "")
-            logger.debug("Creating Custom OpenAIEmbeddings client")
-            http_client = httpx.Client(trust_env=False)
-            return OpenAIEmbeddings(
-                base_url=base_url,
-                model=model_name,
-                api_key=api_key or "custom",
-                http_client=http_client,
-            )
-
-        else:
-            logger.warning(f"Unknown provider '{provider}', falling back to HuggingFace")
-            return HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={"normalize_embeddings": True},
-            )
+        try:
+            return EmbeddingProviderRegistry.create_embeddings(self._provider, self._provider_config)
+        except ValueError as e:
+            logger.warning(f"Provider creation failed: {e}, falling back to HuggingFace")
+            fallback_config = self._config.get("providers", {}).get("huggingface", {})
+            return EmbeddingProviderRegistry.create_embeddings("huggingface", fallback_config)
 
     def get_embeddings(self) -> Embeddings:
-        if self._embeddings is None:
-            logger.debug("Embedding instance not initialized, creating new instance")
-            self._embeddings = self._create_embeddings()
-        return self._embeddings
-
-    def reload_config(self):
-        logger.info("Reloading embedding config")
-        self._load_config()
-        self._embeddings = None
-        logger.info("Embedding config reloaded, instance cleared")
+        """Get cached embeddings instance, creating if necessary."""
+        return self.get_instance()
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed a list of documents."""
         start_time = time.time()
         text_count = len(texts) if texts else 0
         logger.debug(f"Embedding {text_count} documents")
-        
+
         embeddings = self.get_embeddings()
         try:
             result = embeddings.embed_documents(texts)
@@ -156,6 +76,7 @@ class EmbeddingService:
             raise
 
     def embed_query(self, text: str) -> List[float]:
+        """Embed a single query text."""
         start_time = time.time()
         text_size = len(text) if text else 0
         logger.debug(f"Embedding query of size {text_size}")
@@ -172,12 +93,12 @@ class EmbeddingService:
             raise
 
     async def async_embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """异步封装，避免阻塞事件循环"""
+        """Async wrapper for embed_documents to avoid blocking the event loop."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.embed_documents, texts)
 
     async def async_embed_query(self, text: str) -> List[float]:
-        """异步封装，避免阻塞事件循环"""
+        """Async wrapper for embed_query to avoid blocking the event loop."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.embed_query, text)
 
@@ -186,6 +107,7 @@ embedding_service: Optional[EmbeddingService] = None
 
 
 def get_embedding_service() -> EmbeddingService:
+    """Get the global embedding service singleton."""
     global embedding_service
     if embedding_service is None:
         logger.debug("Creating new embedding service instance")
