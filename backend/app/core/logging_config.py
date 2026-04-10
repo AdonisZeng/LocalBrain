@@ -4,15 +4,15 @@ from pathlib import Path
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
+from app.core.paths import get_logs_dir
+
 
 def setup_logging(
-    log_dir: str = "logs",
     log_level: str = "INFO",
     max_bytes: int = 10 * 1024 * 1024,
     backup_count: int = 5,
 ) -> None:
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
+    log_path = get_logs_dir()
     
     today = datetime.now().strftime("%Y%m%d")
     time_str = datetime.now().strftime("%H%M%S")

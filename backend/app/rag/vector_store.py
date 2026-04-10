@@ -6,6 +6,7 @@ from typing import List, Optional, Dict, Any
 from pathlib import Path
 import time
 import sqlite3
+from datetime import datetime, timedelta
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -15,13 +16,40 @@ from app.core.logging_config import get_logger
 from app.core.config import get_config
 from app.core.events import EventBus, ConfigEvent, Event
 from app.providers.vectorstore.registry import VectorStoreProviderRegistry
+from app.core.paths import get_chroma_db_dir
 
 logger = get_logger("vector_store")
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
 
+def recency_boost(results: List[tuple[Document, float]], half_life_days: int = 180) -> List[tuple[Document, float]]:
+    """
+    Apply recency boost to search results.
+    Newer documents receive a higher weight (up to 20% boost).
+    Uses exponential decay: score *= (1 + 0.5^(age/half_life) * 0.2)
+    """
+    if not results:
+        return results
 
+    half_life = timedelta(days=half_life_days)
+    now = datetime.now()
+
+    boosted = []
+    for doc, score in results:
+        created_str = doc.metadata.get("created_at")
+        if created_str:
+            try:
+                created = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+                age_days = (now - created).days
+                recency_factor = 0.5 ** (age_days / half_life.days)
+                boosted_score = score * (1 + recency_factor * 0.2)
+                boosted.append((Document(page_content=doc.page_content, metadata=doc.metadata.copy()), boosted_score))
+            except (ValueError, TypeError):
+                boosted.append((doc, score))
+        else:
+            boosted.append((doc, score))
+
+    logger.debug(f"Recency boost applied: {len(boosted)} results adjusted")
+    return boosted
 class VectorStore:
     """
     Vector store with pluggable provider support.
@@ -366,7 +394,7 @@ class VectorStore:
                     filter=filter,
                 )
 
-            # Apply compression filtering
+            # Apply compression filtering with semantic truncation
             if use_compression and self.compression_enabled and self.compression_threshold > 0 and results:
                 max_score = results[0][1] if results else 1.0
                 min_score = results[-1][1] if results else 0.0
@@ -381,15 +409,37 @@ class VectorStore:
                     if normalized_score >= self.compression_threshold:
                         continue
 
-                    doc_chars = len(doc.page_content)
-                    if total_chars + doc_chars > self.max_context_chars:
-                        continue
+                    if total_chars >= self.max_context_chars:
+                        break
 
-                    filtered_results.append((doc, score))
-                    total_chars += doc_chars
+                    remaining = self.max_context_chars - total_chars
+                    content = doc.page_content
+
+                    # Semantic truncation: find last complete sentence boundary within remaining chars
+                    boundary = -1
+                    for sep in ['。', '！', '？', '.\n', '!\n', '?\n', '\n\n']:
+                        pos = content.rfind(sep, 0, remaining)
+                        if pos > boundary:
+                            boundary = pos
+
+                    if boundary == -1:
+                        # No complete sentence found within limit, truncate at char boundary
+                        if total_chars == 0:
+                            truncated_content = content[:remaining]
+                            truncated_doc = Document(page_content=truncated_content, metadata=doc.metadata.copy())
+                            filtered_results.append((truncated_doc, score))
+                            total_chars += len(truncated_content)
+                    else:
+                        truncated_content = content[:boundary + 1]
+                        truncated_doc = Document(page_content=truncated_content, metadata=doc.metadata.copy())
+                        filtered_results.append((truncated_doc, score))
+                        total_chars += len(truncated_content)
 
                 logger.info(f"Compression: filtered from {len(results)} to {len(filtered_results)} docs, chars: {total_chars}")
                 results = filtered_results
+
+            # Apply recency boost: newer documents get a weight boost
+            results = recency_boost(results)
 
             elapsed = time.time() - start_time
             logger.info(f"Similarity search with score complete: found {len(results)} results in {elapsed * 1000:.2f}ms")
@@ -463,7 +513,7 @@ def get_vector_store() -> VectorStore:
     if vector_store is None:
         logger.debug("Creating new vector store instance")
         vector_store = VectorStore(
-            persist_directory=str(DATA_DIR / "chroma_db"),
+            persist_directory=str(get_chroma_db_dir()),
             collection_name="documents",
         )
     return vector_store

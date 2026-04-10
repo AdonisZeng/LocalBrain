@@ -4,10 +4,12 @@ from functools import lru_cache
 import yaml
 from pydantic import BaseModel
 
+from app.core.paths import get_config_path, get_app_dir
+
 
 class AppConfig(BaseModel):
     name: str = "LocalBrain"
-    version: str = "1.0.0"
+    version: str = ""  # Use version from app.__version__
     data_dir: str = "~/LocalBrain_Data"
     watch_directory: str = "~/LocalBrain_Data/documents"
     environment: str = "development"
@@ -160,7 +162,7 @@ def resolve_env_vars(config: dict) -> dict:
 @lru_cache()
 def get_config(config_path: str = None) -> Config:
     if config_path is None:
-        config_path = get_project_root() / "config.yaml"
+        config_path = get_config_path()
     else:
         config_path = Path(config_path)
     config_dict = load_yaml_config(str(config_path))
@@ -169,21 +171,14 @@ def get_config(config_path: str = None) -> Config:
 
 
 def get_project_root() -> Path:
-    return Path(__file__).parent.parent.parent.parent
+    return get_app_dir()
 
 
 def get_data_dir() -> Path:
-    config = get_config()
-    data_dir_path = Path(config.app.data_dir)
-    if data_dir_path.is_absolute():
-        data_dir = data_dir_path.expanduser()
-    else:
-        data_dir = get_project_root() / data_dir_path
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir
+    from app.core.paths import get_data_dir as paths_get_data_dir
+    return paths_get_data_dir()
 
 
 def get_documents_dir() -> Path:
-    docs_dir = get_data_dir() / "documents"
-    docs_dir.mkdir(parents=True, exist_ok=True)
-    return docs_dir
+    from app.core.paths import get_documents_dir as paths_get_documents_dir
+    return paths_get_documents_dir()

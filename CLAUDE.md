@@ -4,98 +4,104 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LocalBrain is a **local personal knowledge base management system** with AI-powered Q&A (RAG) capabilities. Documents are indexed locally using ChromaDB vector store, with retrieval augmented generation for answering questions.
+LocalBrain is a local personal knowledge base system with AI-powered Q&A. It runs fully locally — FastAPI backend on port 8000, React 19 + Vite frontend on port 5173, SQLite for metadata, ChromaDB for vector storage.
 
-## Tech Stack
+## Commands
 
-- **Backend**: FastAPI, LangChain, ChromaDB, SQLAlchemy (SQLite)
-- **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Radix UI
-- **Python**: D:\Software\uv\envs\trae_cn\Scripts\python.exe
-
-## Running the Application
+### Running the Application
 
 ```bash
-# Option 1: Use the launcher (recommended)
+# Recommended: auto-manages both servers and opens browser
 python launcher.py
 
-# Option 2: Manual startup
-# Terminal 1 - Backend (from project root)
-cd backend && uvicorn app.main:app --host 0.0.0.0 --port 8000
+# Manual: backend only
+cd backend
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-# Terminal 2 - Frontend (from project root)
-cd frontend && npm run dev
+# Manual: frontend only
+cd frontend
+npm run dev
 ```
 
-Access frontend at `http://localhost:5173`, API at `http://localhost:8000`.
+### Frontend
 
-## Backend Architecture
+```bash
+cd frontend
+npm install          # Install dependencies
+npm run dev          # Dev server (port 5173)
+npm run build        # TypeScript check + Vite bundle
+npm run lint         # ESLint
+npm run preview      # Preview production build
+```
 
-### Configuration
-- Main config: `config.yaml` at project root
-- Pydantic models in `backend/app/core/config.py` define the schema
-- `ConfigManager` in `config_manager.py` handles runtime config updates
-- Config changes can be reloaded without restart via the settings API
+### Backend
 
-### Core Services (singleton pattern)
-- `get_llm_service()` - LLM provider abstraction (LM Studio, Ollama, OpenAI, Anthropic, Custom)
-- `get_embedding_service()` - Embedding provider abstraction (HuggingFace, LM Studio, Ollama, OpenAI)
-- `get_vector_store()` - ChromaDB vector store with parent-child document retrieval
+```bash
+cd backend
+# Python interpreter: D:\Development\Python\Nexus\.venv\Scripts\python.exe
+uv pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-### RAG Pipeline
-1. `DocumentLoader` (`rag/document_loader.py`) - Loads PDFs, Markdown, TXT, DOCX
-2. `TextSplitter` - Chunks documents by type (markdown headers, PDF semantic, recursive text)
-3. `VectorStore` - Stores embeddings in ChromaDB with parent-child hierarchy
-4. `ask_question` (`api/qa.py`) - Retrieves relevant docs, builds context prompt, calls LLM
+No test framework is currently configured.
 
-### API Routes
-| Route | File | Purpose |
-|-------|------|---------|
-| `/api/documents` | `api/documents.py` | Upload, list, delete documents |
-| `/api/search` | `api/search.py` | Semantic/keyword/hybrid search |
-| `/api/qa` | `api/qa.py` | RAG-powered question answering |
-| `/api/categories` | `api/categories.py` | Document categorization |
-| `/api/settings` | `api/settings.py` | Runtime config reload |
-| `/api/models` | `api/models.py` | List available LLM/embedding models |
+## Architecture
 
-### Database Models
-SQLite at `./data/localbrain.db`:
-- `Document` - file_path (unique), title, status, category_id
-- `Category` - name (unique), color
-- `Link` - wikilinks between documents
+### High-Level Structure
 
-### Data Directories
-- `./data/` - SQLite DB, ChromaDB vector store, imported documents
-- `./logs/` - Structured JSON logs via structlog
+```
+launcher.py              # Orchestrates both servers, monitors browser connection
+config.yaml              # Single source of truth for all runtime config
+backend/app/
+  main.py                # FastAPI app, CORS, rate limiting, router registration
+  api/                   # 6 route modules (documents, search, qa, categories, settings, models)
+  core/                  # Config loading, interfaces, EventBus for hot-reload
+  models/                # SQLAlchemy ORM (database.py) + Pydantic schemas (schemas.py)
+  providers/             # Pluggable LLM / embedding / vectorstore implementations
+  rag/                   # Document loading, chunking, vector store wrapper
+  services/              # Business logic; BaseModelService handles hot-reload lifecycle
+frontend/src/
+  App.tsx                # Main state: documents, categories, chat history (localStorage)
+  components/            # Sidebar, MainContent, QADialog, SettingsDialog
+  lib/api.ts             # All REST API calls
+```
 
-## Frontend Architecture
+### Provider Registry Pattern
 
-- **State management**: Local React state with useState/useCallback
-- **API layer**: `src/lib/api.ts` - typed API client for all endpoints
-- **Chat history**: Stored in localStorage (not backend)
-- **Components**: Sidebar, MainContent, QADialog, SettingsDialog
-- **UI primitives**: Radix UI dialogs, Tailwind CSS v4 styling
+All AI backend integrations use a decorator-based registry:
 
-## Key Implementation Details
+```python
+@register_llm_provider("ollama")
+class OllamaProvider(BaseLLMProvider): ...
+```
 
-### Parent Document Retrieval
-VectorStore implements parent-child chunk hierarchy:
-- Child chunks (~400 chars) stored for precise retrieval
-- Parent chunks (~2000 chars) retrieved and used as context
-- Reduces token usage while maintaining document coherence
+Supported LLM providers: `openai`, `ollama`, `lmstudio`, `anthropic`, `custom`  
+Supported embedding providers: `huggingface`, `openai`, `ollama`, `lmstudio`, `custom`  
+Vector store: ChromaDB only (currently)
 
-### Compression
-After similarity search, results are filtered by:
-- Score threshold (default 0.5)
-- Max context chars (default 4000)
-- Preserves only the most relevant passages
+All provider interfaces are defined in `backend/app/core/interfaces.py`.
 
-### Hybrid Search
-Configurable RRF (Reciprocal Rank Fusion) combining:
-- Semantic search (vector similarity)
-- Keyword search (BM25)
-- Weights configurable in `config.yaml`
+### Configuration Hot-Reload
 
-### Rate Limiting
-Uses slowapi with configurable limits:
-- Default: 60 requests/minute for local, 120 for LAN
-- Configurable via `config.yaml` security section
+`config.yaml` is the live config. When settings are changed via the `/api/settings` endpoints:
+1. The API writes to `config.yaml`
+2. `EventBus` emits a typed event (`LLM_CONFIG_CHANGED`, `EMBEDDING_CONFIG_CHANGED`, etc.)
+3. `BaseModelService` subclasses (`LLMService`, `EmbeddingService`) subscribe to events and reset their instances
+4. Next call to `get_instance()` triggers lazy re-initialization with new config
+
+### RAG Pipeline Flow
+
+`/api/qa` POST → `LLMService.get_instance()` + `EmbeddingService.get_instance()` → `VectorStore` retrieval (semantic/keyword/hybrid with optional RRF reranking) → LangChain chain → streamed response
+
+Document ingestion: upload → `DocumentLoader` (PDF/MD/TXT/DOCX) → format-specific `TextSplitter` → embed → persist to ChromaDB + SQLite status update.
+
+### Data Layer
+
+- **SQLite** (`localbrain.db`): `documents`, `categories`, `links` tables via SQLAlchemy ORM
+- **ChromaDB** (`data/chroma_db/`): Vector embeddings with persistence
+- **Config**: `config.yaml` (YAML, runtime-mutable via API)
+- **Documents**: stored under `data/documents/`
+
+### Frontend State
+
+`App.tsx` manages all global state. Chat history is persisted to `localStorage`. The frontend proxies API requests to `http://localhost:8000` via Vite dev config.

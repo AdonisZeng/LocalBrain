@@ -99,27 +99,31 @@ async def hybrid_search(query: str, k: int = 4, db: Session = None) -> list[Sear
     semantic_results = await semantic_search(query, k=k * 2)
     keyword_results = await keyword_search(query, k=k * 2, db=db)
 
-    # 从配置读取混合搜索权重
+    # RRF fusion: combine results using Reciprocal Rank Fusion formula
     config = get_config()
-    weights = config.hybrid_search.weights
-    semantic_weight = weights.semantic
-    keyword_weight = weights.keyword
+    rrf_k = config.hybrid_search.get("rrf_k", 60)
 
     seen_ids = set()
-    merged_results = []
+    merged: list[SearchResult] = []
+    id_to_result: dict[int, SearchResult] = {}
 
-    for result in semantic_results:
-        if result.id not in seen_ids:
-            seen_ids.add(result.id)
-            result.score = result.score * semantic_weight
-            merged_results.append(result)
+    # Map id -> result for quick lookup
+    for r in semantic_results + keyword_results:
+        id_to_result[r.id] = r
 
-    for result in keyword_results:
-        if result.id not in seen_ids:
-            seen_ids.add(result.id)
-            result.score = result.score * keyword_weight
-            merged_results.append(result)
+    scores: dict[int, float] = {}
+    for rank, result in enumerate(semantic_results):
+        doc_id = result.id
+        scores[doc_id] = scores.get(doc_id, 0) + 1 / (rrf_k + rank + 1)
+    for rank, result in enumerate(keyword_results):
+        doc_id = result.id
+        scores[doc_id] = scores.get(doc_id, 0) + 1 / (rrf_k + rank + 1)
 
-    merged_results.sort(key=lambda x: x.score, reverse=True)
+    sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)
 
-    return merged_results[:k]
+    for doc_id in sorted_ids[:k]:
+        result = id_to_result[doc_id]
+        result.score = scores[doc_id]
+        merged.append(result)
+
+    return merged

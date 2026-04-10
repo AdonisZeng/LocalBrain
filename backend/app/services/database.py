@@ -6,14 +6,11 @@ from pathlib import Path
 import logging
 
 from app.models.database import Base
+from app.core.paths import get_database_path
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
-
-DATABASE_URL = f"sqlite:///{DATA_DIR / 'localbrain.db'}"
+DATABASE_URL = f"sqlite:///{get_database_path()}"
 
 
 class Database:

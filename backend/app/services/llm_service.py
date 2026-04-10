@@ -117,3 +117,90 @@ def get_llm_service() -> LLMService:
         logger.debug("Creating new LLM service instance")
         llm_service = LLMService()
     return llm_service
+
+
+def adaptive_k(question: str) -> int:
+    """Determine retrieval k based on question complexity."""
+    question_len = len(question)
+    has_multiple = any(m in question for m in ["和", "与", "还是", "哪些", "多少", "分别"])
+    has_comparison = any(c in question for c in ["比", "哪个更", "不如", "优于"])
+    is_list_type = any(m in question for m in ["列出", "列举", "罗列", "有哪些"])
+
+    if question_len > 100 or has_multiple or has_comparison:
+        return 8
+    elif question_len < 15 or is_list_type:
+        return 2
+    return 4
+
+
+def expand_query(question: str, llm_service_instance) -> list[str]:
+    """
+    Use LLM to generate multiple search queries for the same question.
+    Each query approaches the question from a different angle.
+    """
+    prompt = f"""为以下问题生成3个不同的搜索 query，用于从文档库中检索相关内容。
+要求：每个 query 控制在20字以内，角度不同，用换行分隔。只需输出3行，不要其他内容。
+
+问题：{question}
+
+搜索 query："""
+    try:
+        response = llm_service_instance.generate(prompt)
+        queries = [
+            q.strip() for q in response.split('\n')
+            if q.strip() and len(q.strip()) <= 25
+        ]
+        logger.debug(f"Query expansion: {len(queries)} queries generated")
+        return queries[:3]
+    except Exception as e:
+        logger.warning(f"Query expansion failed: {e}, falling back to original question")
+        return [question]
+
+
+def hyde_expand(question: str, llm_service) -> list[str]:
+    """
+    HyDE (Hypothetical Document Embeddings):
+    Generate a hypothetical answer document, then retrieve using both
+    the original query and the generated answer. RRF fused.
+    """
+    hyde_prompt = f"""假设你是文档库中的内容。请为以下问题写一段假设性的回答，
+这段回答应该是在相关文档中可能找到的内容格式和风格。
+控制在100字以内。
+
+问题：{question}
+
+假设性回答："""
+    try:
+        hypothetical = llm_service.generate(hyde_prompt)
+        logger.info(f"HyDE generated hypothetical answer: {len(hypothetical)} chars")
+        return [question, hypothetical]
+    except Exception as e:
+        logger.warning(f"HyDE generation failed: {e}, falling back to original question")
+        return [question]
+
+
+def decompose_question(question: str, llm_service) -> list[str]:
+    """
+    Decompose a complex multi-hop question into sub-questions.
+    Each sub-question is retrieved independently, then answers are synthesized.
+    """
+    decomp_prompt = f"""将以下复杂问题分解为2-3个简单的子问题。
+每个子问题应该可以独立检索并回答。用换行分隔，仅输出子问题不要其他内容。
+
+复杂问题：{question}
+
+子问题："""
+    try:
+        response = llm_service.generate(decomp_prompt)
+        sub_questions = [
+            q.strip() for q in response.split('\n')
+            if q.strip() and len(q.strip()) < 100
+        ]
+        if len(sub_questions) >= 2:
+            logger.info(f"Question decomposed into {len(sub_questions)} sub-questions: {sub_questions}")
+            return sub_questions
+        logger.debug(f"Decomposition yielded {len(sub_questions)} sub-questions, using original")
+        return [question]
+    except Exception as e:
+        logger.warning(f"Question decomposition failed: {e}")
+        return [question]

@@ -15,7 +15,8 @@ from app.models.schemas import (
 from app.models.database import Document, Category
 from app.services.database import get_db
 from app.rag.document_loader import DocumentLoader, TextSplitter
-from app.rag.vector_store import get_vector_store, DATA_DIR
+from app.rag.vector_store import get_vector_store
+from app.core.paths import get_documents_dir
 from app.core.logging_config import get_logger
 
 router = APIRouter()
@@ -192,7 +193,7 @@ async def upload_document(
             detail=f"不支持的文件类型: {file_ext}。支持的类型: {', '.join(ALLOWED_EXTENSIONS)}"
         )
 
-    upload_dir = DATA_DIR / "documents"
+    upload_dir = get_documents_dir()
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     file_path = upload_dir / safe_filename
